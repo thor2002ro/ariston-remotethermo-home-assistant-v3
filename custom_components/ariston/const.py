@@ -79,9 +79,9 @@ EXTRA_STATE_ATTRIBUTE: Final[str] = "Attribute"
 EXTRA_STATE_DEVICE_METHOD: Final[str] = "DeviceMethod"
 
 # ==================== CONSUMPTION KEYS (API TRUTH) ====================
-GAS_HEATING_KEY: Final[int] = 1      # Central Heating Gas (kWh)
-GAS_DHW_KEY: Final[int] = 2          # Domestic Hot Water Gas (kWh)
-ELEC_HEATING_KEY: Final[int] = 10    # Central Heating Electricity (kWh)
+GAS_HEATING_KEY: Final[int] = 7      # Central Heating Gas (kWh)
+GAS_DHW_KEY: Final[int] = 10         # Domestic Hot Water Gas (kWh)
+ELEC_HEATING_KEY: Final[int] = 20    # Central Heating Electricity (kWh)
 ELEC_DHW_KEY: Final[int] = 21        # Domestic Hot Water Electricity (kWh)
 
 # ==================== RAW ACCESS ====================
@@ -99,12 +99,12 @@ def get_consumption_sequence(entity, key: int, period: int) -> list[float] | Non
 # ==================== PRIMITIVES ====================
 
 def _last(values: list[float]) -> float | None:
-    return round(values[-1], 2) if values and values[-1] > 0 else None
+    return round(values[-1], 2) if values else None
 
 
 def _last_nonzero(values: list[float]) -> float | None:
     for v in reversed(values or []):
-        if v > 0:
+        if v is not None:
             return round(v, 2)
     return None
 
@@ -119,11 +119,18 @@ def _current_month(values: list[float]) -> float | None:
     """
     API returns finalized daily values.
     Today is excluded because it may be partial.
+    p=3 is year-to-date daily arrays. We only sum the subset belonging to the current month.
     """
     if not values:
         return None
-    days_completed = dt.datetime.now().day - 1
-    return round(sum(values[:days_completed]), 2)
+        
+    now = dt.datetime.now()
+    first_of_month = now.replace(day=1)
+    
+    # Python's tm_yday is 1-indexed. We want 0-indexed offset in the array.
+    start_index = first_of_month.timetuple().tm_yday - 1
+    
+    return round(sum(values[start_index:]), 2)
 
 
 # ==================== SEMANTIC ACCESS ====================
@@ -137,7 +144,8 @@ def current_month(entity, key: int) -> float | None:
 
 
 def last_month(entity, key: int) -> float | None:
-    return _last_nonzero(get_consumption_sequence(entity, key, 4) or [])
+    # p=4 contains monthly trailing data. Index 12 (last element) is the most recent full month.
+    return _last(get_consumption_sequence(entity, key, 4) or [])
 
 
 def rolling(entity, key: int, period: int, length: int) -> float | None:
