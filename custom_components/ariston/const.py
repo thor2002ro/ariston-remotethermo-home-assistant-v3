@@ -42,6 +42,7 @@ from homeassistant.components.sensor import (
 from homeassistant.components.switch import SwitchEntityDescription
 from homeassistant.const import UnitOfEnergy, UnitOfTemperature, UnitOfTime, UnitOfVolume
 from homeassistant.helpers.entity import EntityCategory, EntityDescription
+from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 try:
@@ -97,6 +98,39 @@ GAS_CALORIFIC_VALUES_KWH_PER_M3 = {
 }
 DEFAULT_CALORIFIC_VALUE = 11.2
 DEFAULT_GAS_TYPE = GasType.NATURAL_GAS
+
+# Per-device custom calorific value overrides.
+# Key: device gateway/ID string.  Value: kWh/m³ entered by the user.
+# Cleared automatically whenever the gas type selector changes so the
+# displayed value always reflects the new gas type's default unless the
+# user subsequently edits it again.
+_calorific_value_overrides: dict[str, float] = {}
+
+_STORAGE_KEY = "ariston.calorific_overrides"
+_STORAGE_VERSION = 1
+
+
+def _device_id(entity: Any) -> str:
+    """Return a stable string key that uniquely identifies a device."""
+    # Prefer `gateway` (present on most Ariston device objects); fall back to
+    # the Python id() so the dict never raises a KeyError on unusual objects.
+    return str(getattr(entity.device, "gateway", id(entity.device)))
+
+
+async def async_load_calorific_overrides(hass: Any) -> None:
+    """Load saved calorific overrides from disk into memory."""
+    store: Store = Store(hass, _STORAGE_VERSION, _STORAGE_KEY)
+    data = await store.async_load()
+    if data and isinstance(data, dict):
+        _calorific_value_overrides.update(data)
+        _LOGGER.debug("Loaded calorific overrides from storage: %s", data)
+
+
+async def _async_save_calorific_overrides(hass: Any) -> None:
+    """Save calorific overrides from memory to disk."""
+    store: Store = Store(hass, _STORAGE_VERSION, _STORAGE_KEY)
+    await store.async_save(dict(_calorific_value_overrides))
+
 
 # ==================== DATA PROCESSING UTILITIES ====================
 
@@ -164,18 +198,87 @@ def get_gas_type_from_config(entity: Any) -> GasType:
     except (ValueError, TypeError):
         return DEFAULT_GAS_TYPE
 
-def get_gas_calorific_value(entity: Any) -> float:
-    """Return the calorific value based on device gas type."""
+
+def get_default_calorific_value_for_gas_type(entity: Any) -> float:
+    """Return the *built-in* calorific value for the device's current gas type.
+
+    This is the unmodified lookup from the static table and is used both as a
+    display fallback and to re-seed the editable number entity after a gas-type
+    change.
+    """
     return GAS_CALORIFIC_VALUES_KWH_PER_M3.get(
         get_gas_type_from_config(entity),
         DEFAULT_CALORIFIC_VALUE,
     )
 
+
+def get_gas_calorific_value(entity: Any) -> float:
+    """Return the *effective* calorific value for the device.
+
+    Priority order:
+    1. A user-supplied custom value stored in ``_calorific_value_overrides``.
+    2. The built-in default for the device's current gas type.
+
+    This function is the single source of truth used by every m³ conversion so
+    that both the sensor display and all consumption calculations stay in sync.
+    """
+    return _calorific_value_overrides.get(
+        _device_id(entity),
+        get_default_calorific_value_for_gas_type(entity),
+    )
+
+
+def set_gas_calorific_value(entity: Any, value: float) -> None:
+    """Persist a custom calorific value for the given device (in-memory).
+
+    The value survives for the lifetime of the HA process.  It is cleared by
+    ``clear_calorific_value_override`` when the gas type selector changes so
+    the stored override never silently contradicts the selected gas type.
+    """
+    _calorific_value_overrides[_device_id(entity)] = round(value, 4)
+    _LOGGER.debug(
+        "Custom calorific value set for device %s: %.4f kWh/m³",
+        _device_id(entity),
+        value,
+    )
+
+
+def clear_calorific_value_override(entity: Any) -> None:
+    """Remove any custom calorific value for the device.
+
+    Called automatically by the gas-type select wrapper so the editable number
+    entity reverts to the new gas type's built-in default.
+    """
+    key = _device_id(entity)
+    removed = _calorific_value_overrides.pop(key, None)
+    if removed is not None:
+        _LOGGER.debug(
+            "Custom calorific value cleared for device %s (was %.4f kWh/m³)",
+            key,
+            removed,
+        )
+
+
+async def _async_set_and_save_calorific_value(entity: Any, value: float) -> None:
+    """Set the gas calorific override, save to disk, and refresh sensors."""
+    set_gas_calorific_value(entity, value)
+    await _async_save_calorific_overrides(entity.hass)
+    await entity.coordinator.async_request_refresh()
+
+
+async def _async_clear_and_set_gas_type(entity: Any, option: str) -> None:
+    """Clear the calorific override, save, and set the new gas type."""
+    clear_calorific_value_override(entity)
+    await _async_save_calorific_overrides(entity.hass)
+    await entity.device.async_set_gas_type(option)
+
+
 def gas_kwh_to_m3(entity: Any, value: float | None) -> float | None:
-    """Convert kWh to m³ based on calorific value."""
+    """Convert kWh to m³ based on the *effective* calorific value."""
     if value is None:
         return None
     return round(value / get_gas_calorific_value(entity), 3)
+
 
 # ==================== ENTITY DESCRIPTION BASE CLASSES ====================
 
@@ -449,8 +552,11 @@ ARISTON_SENSOR_TYPES: list[AristonSensorEntityDescription] = [
         system_types=[SystemType.VELIS],
         whe_types=[WheType.Lux, WheType.Evo, WheType.Evo2, WheType.Lydos, WheType.LydosHybrid, WheType.Andris2, WheType.Lux2],
     ),
-    
+
     # --- Gas Config Sensor ---
+    # This sensor always reflects the *effective* calorific value — either a
+    # custom value entered via the number entity below, or the built-in default
+    # for the currently selected gas type.
     AristonSensorEntityDescription(
         key="gas_calorific_value",
         name=f"{NAME} gas calorific value",
@@ -459,6 +565,7 @@ ARISTON_SENSOR_TYPES: list[AristonSensorEntityDescription] = [
         native_unit_of_measurement=f"{UnitOfEnergy.KILO_WATT_HOUR}/{UnitOfVolume.CUBIC_METERS}",
         device_features=[DeviceFeatures.HAS_METERING],
         coordinator=ENERGY_COORDINATOR,
+        # get_gas_calorific_value honours the user override if present
         get_native_value=get_gas_calorific_value,
     ),
 
@@ -553,11 +660,51 @@ ARISTON_NUMBER_TYPES: list[AristonNumberEntityDescription] = [
     AristonNumberEntityDescription(key=ThermostatProperties.HEATING_FLOW_OFFSET, name=f"{NAME} heating flow offset", icon="mdi:progress-wrench", native_unit_of_measurement=UnitOfTemperature.CELSIUS, entity_category=EntityCategory.CONFIG, zone=True, get_native_min_value=lambda e: e.device.get_heating_flow_offset_min(e.zone), get_native_max_value=lambda e: e.device.get_heating_flow_offset_max(e.zone), get_native_step=lambda e: e.device.get_heating_flow_offset_step(e.zone), get_native_value=lambda e: e.device.get_heating_flow_offset_value(e.zone), set_native_value=lambda e, v: e.device.async_set_heating_flow_offset(v, e.zone), system_types=[SystemType.GALEVO]),
     AristonNumberEntityDescription(key=EvoOneDeviceProperties.AV_SHW, name=f"{NAME} requested number of showers", icon="mdi:shower-head", native_min_value=0, get_native_max_value=lambda e: e.device.max_req_shower, native_step=1, get_native_value=lambda e: e.device.req_shower, set_native_value=lambda e, v: e.device.async_set_water_heater_number_of_showers(int(v)), whe_types=[WheType.Evo]),
     AristonNumberEntityDescription(key=SeDeviceSettings.SE_ANTI_COOLING_TEMPERATURE, name=f"{NAME} anti cooling temperature", icon="mdi:thermometer-alert", entity_category=EntityCategory.CONFIG, get_native_min_value=lambda e: e.device.anti_cooling_temperature_minimum, get_native_max_value=lambda e: e.device.anti_cooling_temperature_maximum, native_step=1, get_native_value=lambda e: e.device.anti_cooling_temperature_value, set_native_value=lambda e, v: e.device.async_set_cooling_temperature_value(int(v)), whe_types=[WheType.LydosHybrid]),
+
+    # ---- Editable gas calorific value ----
+    # Displayed in the CONFIG category so it appears in the device settings UI.
+    # Reading returns the *effective* value (custom override or gas-type default).
+    # Writing stores a custom override for this device only.
+    # The companion sensor "gas_calorific_value" in ARISTON_SENSOR_TYPES shows
+    # the same effective value as a diagnostic sensor.
+    AristonNumberEntityDescription(
+        key="gas_calorific_value_input",
+        name=f"{NAME} gas calorific value",
+        icon="mdi:gas-cylinder",
+        entity_category=EntityCategory.CONFIG,
+        native_unit_of_measurement=f"{UnitOfEnergy.KILO_WATT_HOUR}/{UnitOfVolume.CUBIC_METERS}",
+        # Practical range: 1–50 kWh/m³ covers all real gas types with headroom.
+        native_min_value=1.0,
+        native_max_value=50.0,
+        native_step=0.1,
+        device_features=[DeviceFeatures.HAS_METERING],
+        coordinator=ENERGY_COORDINATOR,
+        # Returns the effective value (override if set, otherwise gas-type default)
+        get_native_value=get_gas_calorific_value,
+        # Stores the user's custom value, saves to disk, and refreshes sensors.
+        set_native_value=_async_set_and_save_calorific_value,
+        system_types=[SystemType.GALEVO],
+    ),
 ]
 
 ARISTON_SELECT_TYPES: list[AristonSelectEntityDescription] = [
     AristonSelectEntityDescription(key=ConsumptionProperties.CURRENCY, name=f"{NAME} currency", icon="mdi:cash-100", device_class=SensorDeviceClass.MONETARY, entity_category=EntityCategory.CONFIG, device_features=[DeviceFeatures.HAS_METERING], coordinator=ENERGY_COORDINATOR, get_current_option=lambda e: e.device.currency, get_options=lambda e: e.device.get_currencies(), select_option=lambda e, o: e.device.async_set_currency(o), system_types=[SystemType.GALEVO]),
-    AristonSelectEntityDescription(key=ConsumptionProperties.GAS_TYPE, name=f"{NAME} gas type", icon="mdi:gas-cylinder", entity_category=EntityCategory.CONFIG, device_features=[DeviceFeatures.HAS_METERING], coordinator=ENERGY_COORDINATOR, get_current_option=lambda e: e.device.gas_type, get_options=lambda e: e.device.get_gas_types(), select_option=lambda e, o: e.device.async_set_gas_type(o), system_types=[SystemType.GALEVO]),
+    # Gas type: clears any custom calorific value override so the editable
+    # number entity (and the sensor) immediately reflect the new gas type's
+    # built-in default on the next coordinator refresh.
+    AristonSelectEntityDescription(
+        key=ConsumptionProperties.GAS_TYPE,
+        name=f"{NAME} gas type",
+        icon="mdi:gas-cylinder",
+        entity_category=EntityCategory.CONFIG,
+        device_features=[DeviceFeatures.HAS_METERING],
+        coordinator=ENERGY_COORDINATOR,
+        get_current_option=lambda e: e.device.gas_type,
+        get_options=lambda e: e.device.get_gas_types(),
+        # Clear the calorific override, save, then set the new gas type.
+        select_option=_async_clear_and_set_gas_type,
+        system_types=[SystemType.GALEVO],
+    ),
     AristonSelectEntityDescription(key=ConsumptionProperties.GAS_ENERGY_UNIT, name=f"{NAME} gas energy unit", icon="mdi:cube-scan", entity_category=EntityCategory.CONFIG, device_features=[DeviceFeatures.HAS_METERING], coordinator=ENERGY_COORDINATOR, get_current_option=lambda e: e.device.gas_energy_unit, get_options=lambda e: e.device.get_gas_energy_units(), select_option=lambda e, o: e.device.async_set_gas_energy_unit(o), system_types=[SystemType.GALEVO]),
     AristonSelectEntityDescription(key=DeviceProperties.HYBRID_MODE, name=f"{NAME} hybrid mode", icon="mdi:cog", entity_category=EntityCategory.CONFIG, device_features=[DeviceFeatures.HYBRID_SYS], get_current_option=lambda e: e.device.hybrid_mode, get_options=lambda e: e.device.hybrid_mode_opt_texts, select_option=lambda e, o: e.device.async_set_hybrid_mode(o), system_types=[SystemType.GALEVO]),
     AristonSelectEntityDescription(key=DeviceProperties.BUFFER_CONTROL_MODE, name=f"{NAME} buffer control mode", icon="mdi:cup-water", entity_category=EntityCategory.CONFIG, device_features=[DeviceFeatures.BUFFER_TIME_PROG_AVAILABLE], get_current_option=lambda e: e.device.buffer_control_mode, get_options=lambda e: e.device.buffer_control_mode_opt_texts, select_option=lambda e, o: e.device.async_set_buffer_control_mode(o), system_types=[SystemType.GALEVO]),

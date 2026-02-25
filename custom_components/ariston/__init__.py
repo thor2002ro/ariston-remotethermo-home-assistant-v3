@@ -34,6 +34,7 @@ from .const import (
     DOMAIN,
     ENERGY_COORDINATOR,
     ENERGY_SCAN_INTERVAL,
+    async_load_calorific_overrides,
 )
 from .coordinator import DeviceDataUpdateCoordinator
 
@@ -100,6 +101,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator = DeviceDataUpdateCoordinator(
             hass, device, scan_interval_seconds, COORDINATOR, device.async_update_state
         )
+
+        # Load persisted gas calorific overrides from disk
+        await async_load_calorific_overrides(hass)
 
         hass.data.setdefault(DOMAIN, {}).setdefault(
             entry.unique_id, {COORDINATOR: {}, ENERGY_COORDINATOR: {}}
